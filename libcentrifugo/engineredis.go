@@ -166,6 +166,7 @@ end
 return n
 	`
 
+	// TODO: make it integer in config (backwards incompatible).
 	dbNum, err := strconv.Atoi(db)
 	if err != nil {
 		logger.FATAL.Fatalln("Can not convert redis db to number")
@@ -285,41 +286,28 @@ func (e *RedisEngine) runAPI() {
 	}
 
 	for {
-		reply, err := e.client.BLPop(0, popParams...).Result()
+		result, err := e.client.BLPop(0, popParams...).Result()
 		if err != nil {
 			logger.ERROR.Println(err)
 			return
 		}
 
-		println(reply)
+		if len(result) != 2 {
+			logger.ERROR.Println("Wrong reply from Redis in BLPOP - expecting 2 values")
+			continue
+		}
 
-		/*
-			values, err := redis.Values(reply, nil)
-			if err != nil {
-				logger.ERROR.Println(err)
-				return
-			}
-			if len(values) != 2 {
-				logger.ERROR.Println("Wrong reply from Redis in BLPOP - expecting 2 values")
-				continue
-			}
+		queue := result[0]
+		body := []byte(result[1])
 
-			queue, okQ := values[0].([]byte)
-			body, okVal := values[1].([]byte)
-			if !okQ || !okVal {
-				logger.ERROR.Println("Wrong reply from Redis in BLPOP - can not convert value")
-				continue
-			}
+		// Pick worker based on queue
+		q, ok := workQueues[queue]
+		if !ok {
+			logger.ERROR.Println("Got message from a queue we didn't even know about!")
+			continue
+		}
 
-			// Pick worker based on queue
-			q, ok := workQueues[string(queue)]
-			if !ok {
-				logger.ERROR.Println("Got message from a queue we didn't even know about!")
-				continue
-			}
-
-			q <- body
-		*/
+		q <- body
 	}
 }
 
@@ -468,9 +456,13 @@ func (e *RedisEngine) publish(chID ChannelID, message []byte, opts *publishOpts)
 				logger.ERROR.Println(err)
 				return nil
 			}
-			err = e.pubScript.Run(e.client, []string{e.getHistoryKey(chID)}, []string{string(chID), message, messageJSON, opts.HistorySize, opts.HistoryLifetime, opts.HistoryDropInactive}).Err()
+			dropInactive := "0"
+			if opts.HistoryDropInactive {
+				dropInactive = "1"
+			}
+			err = e.pubScript.Run(e.client, []string{e.getHistoryKey(chID)}, []string{string(chID), string(message), string(messageJSON), strconv.Itoa(opts.HistorySize), strconv.Itoa(opts.HistoryLifetime), dropInactive}).Err()
 		} else {
-			err = e.client.Publish(chID, message).Err()
+			err = e.client.Publish(string(chID), string(message)).Err()
 		}
 	}
 	return err
@@ -510,7 +502,8 @@ func (e *RedisEngine) getHistoryKey(chID ChannelID) string {
 
 func (e *RedisEngine) addPresence(chID ChannelID, uid ConnID, info ClientInfo) error {
 	e.app.RLock()
-	presenceExpireSeconds := e.app.config.PresenceExpireInterval.Seconds()
+	presenceExpire := e.app.config.PresenceExpireInterval
+	presenceExpireSeconds := presenceExpire.Seconds()
 	e.app.RUnlock()
 	infoJSON, err := json.Marshal(info)
 	if err != nil {
@@ -526,14 +519,14 @@ func (e *RedisEngine) addPresence(chID ChannelID, uid ConnID, info ClientInfo) e
 	}
 	defer tx.Close()
 
-	tx.ZAdd(setKey, expireAt, uid)
-	tx.HSet(hashKey, uid, infoJSON)
-	tx.Expire(setKey, presenceExpireSeconds)
-	tx.Expire(hashKey, presenceExpireSeconds)
-
+	tx.ZAdd(setKey, redis.Z{Score: float64(expireAt), Member: uid})
+	tx.HSet(hashKey, string(uid), string(infoJSON))
+	tx.Expire(setKey, presenceExpire)
+	tx.Expire(hashKey, presenceExpire)
 	_, err = tx.Exec(func() error {
 		return nil
 	})
+
 	return err
 }
 
@@ -548,31 +541,24 @@ func (e *RedisEngine) removePresence(chID ChannelID, uid ConnID) error {
 	}
 	defer tx.Close()
 
-	tx.HDel(hashKey, uid)
-	tx.ZRem(setKey, uid)
+	tx.HDel(hashKey, string(uid))
+	tx.ZRem(setKey, string(uid))
 	_, err = tx.Exec(func() error {
 		return nil
 	})
 	return err
 }
 
-func mapStringClientInfo(result interface{}, err error) (map[ConnID]ClientInfo, error) {
-	values, err := redis.Values(result, err)
-	if err != nil {
-		return nil, err
-	}
-	if len(values)%2 != 0 {
+func mapStringClientInfo(result []string, err error) (map[ConnID]ClientInfo, error) {
+	if len(result)%2 != 0 {
 		return nil, errors.New("mapStringClientInfo expects even number of values result")
 	}
-	m := make(map[ConnID]ClientInfo, len(values)/2)
-	for i := 0; i < len(values); i += 2 {
-		key, okKey := values[i].([]byte)
-		value, okValue := values[i+1].([]byte)
-		if !okKey || !okValue {
-			return nil, errors.New("ScanMap key not a bulk string value")
-		}
+	m := make(map[ConnID]ClientInfo, len(result)/2)
+	for i := 0; i < len(result); i += 2 {
+		key := result[i]
+		value := result[i+1]
 		var f ClientInfo
-		err = json.Unmarshal(value, &f)
+		err = json.Unmarshal([]byte(value), &f)
 		if err != nil {
 			return nil, errors.New("can not unmarshal value to ClientInfo")
 		}
@@ -587,28 +573,23 @@ func (e *RedisEngine) presence(chID ChannelID) (map[ConnID]ClientInfo, error) {
 	hashKey := e.getHashKey(chID)
 	setKey := e.getSetKey(chID)
 	opts := redis.ZRangeByScore{
-		Min: 0,
-		Max: now,
+		Min: "0",
+		Max: strconv.Itoa(int(now)),
 	}
 	expiredKeys, err := e.client.ZRangeByScore(setKey, opts).Result()
 	if err != nil {
 		return nil, err
 	}
-	/*
-		expiredKeys, err := redis.Strings(reply, nil)
-		if err != nil {
-			return nil, err
-		}
-	*/
+
 	if len(expiredKeys) > 0 {
 
 		tx, err := e.client.Watch(setKey, hashKey)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer tx.Close()
 
-		tx.ZRemRangeByScore(key, setKey, 0, now)
+		tx.ZRemRangeByScore(setKey, "0", strconv.Itoa(int(now)))
 		for _, key := range expiredKeys {
 			tx.HDel(hashKey, key)
 		}
@@ -619,26 +600,18 @@ func (e *RedisEngine) presence(chID ChannelID) (map[ConnID]ClientInfo, error) {
 			return nil, err
 		}
 	}
-	reply, err := e.client.HGetAll(hashKey)
+	reply, err := e.client.HGetAll(hashKey).Result()
 	if err != nil {
 		return nil, err
 	}
 	return mapStringClientInfo(reply, nil)
 }
 
-func sliceOfMessages(result interface{}, err error) ([]Message, error) {
-	values, err := redis.Values(result, err)
-	if err != nil {
-		return nil, err
-	}
-	msgs := make([]Message, len(values))
-	for i := 0; i < len(values); i++ {
-		value, okValue := values[i].([]byte)
-		if !okValue {
-			return nil, errors.New("error getting Message value")
-		}
+func sliceOfMessages(result []string, err error) ([]Message, error) {
+	msgs := make([]Message, len(result))
+	for i := 0; i < len(result); i++ {
 		var m Message
-		err = json.Unmarshal(value, &m)
+		err = json.Unmarshal([]byte(result[i]), &m)
 		if err != nil {
 			return nil, errors.New("can not unmarshal value to Message")
 		}
@@ -653,24 +626,17 @@ func (e *RedisEngine) history(chID ChannelID, opts historyOpts) ([]Message, erro
 		rangeBound = opts.Limit - 1 // Redis includes last index into result
 	}
 	historyKey := e.getHistoryKey(chID)
-	reply, err := e.client.LRange(historyKey, 0, rangeBound)
+	reply, err := e.client.LRange(historyKey, 0, int64(rangeBound)).Result()
 	if err != nil {
 		return nil, err
 	}
 	return sliceOfMessages(reply, nil)
 }
 
-func sliceOfChannelIDs(result interface{}, prefix string, err error) ([]ChannelID, error) {
-	values, err := redis.Values(result, err)
-	if err != nil {
-		return nil, err
-	}
-	channels := make([]ChannelID, len(values))
-	for i := 0; i < len(values); i++ {
-		value, okValue := values[i].([]byte)
-		if !okValue {
-			return nil, errors.New("error getting ChannelID value")
-		}
+func sliceOfChannelIDs(result []string, prefix string, err error) ([]ChannelID, error) {
+	channels := make([]ChannelID, len(result))
+	for i := 0; i < len(result); i++ {
+		value := result[i]
 		chID := ChannelID(value)
 		channels[i] = chID
 	}
@@ -680,7 +646,7 @@ func sliceOfChannelIDs(result interface{}, prefix string, err error) ([]ChannelI
 // Requires Redis >= 2.8.0 (http://redis.io/commands/pubsub)
 func (e *RedisEngine) channels() ([]ChannelID, error) {
 	prefix := e.app.channelIDPrefix()
-	reply, err := e.client.PubSubChannels(prefix + "*")
+	reply, err := e.client.PubSubChannels(prefix + "*").Result()
 	if err != nil {
 		return nil, err
 	}
