@@ -328,11 +328,7 @@ func fillBatchFromChan(ch <-chan subRequest, batch *[]subRequest, chIDs *[]strin
 
 func (e *RedisEngine) runPubSub() {
 
-	pubsub, err := e.client.Subscribe("just-to-get-pubsub-now-need-a-better-way")
-	if err != nil {
-		logger.ERROR.Println(err)
-		return
-	}
+	pubsub := e.client.PubSub()
 	defer pubsub.Close()
 
 	e.app.RLock()
@@ -436,6 +432,11 @@ func (e *RedisEngine) runPubSub() {
 		case *redis.Message:
 			e.app.handleMsg(ChannelID(msg.Channel), []byte(msg.Payload))
 		case *redis.Subscription:
+			// Ignore.
+		case *redis.Pong:
+			// Ignore.
+		case *redis.PMessage:
+			// Ignore.
 		default:
 			logger.ERROR.Printf("RedisEngine Receiver error: unknown message %#v\n", msgi)
 			return
