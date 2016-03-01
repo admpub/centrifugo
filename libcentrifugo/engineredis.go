@@ -60,6 +60,10 @@ type RedisEngineConfig struct {
 	// NumAPIShards is a number of sharded API queues in Redis to increase volume of commands
 	// (most probably publish) that Centrifugo instance can process.
 	NumAPIShards int
+	//
+	Master string
+	//
+	SentinelAddrs []string
 }
 
 // subRequest is an internal request to subscribe or unsubscribe from one or more channels
@@ -172,19 +176,38 @@ return n
 		logger.FATAL.Fatalln("Can not convert redis db to number")
 	}
 
-	options := &redis.Options{
-		Addr:         server,
-		Password:     password,
-		DB:           int64(dbNum),
-		MaxRetries:   1,
-		DialTimeout:  time.Second,
-		ReadTimeout:  time.Second,
-		WriteTimeout: time.Second,
-		PoolSize:     conf.PoolSize,
-		PoolTimeout:  time.Second,
-	}
+	var client *redis.Client
 
-	client := redis.NewClient(options)
+	if len(conf.SentinelAddrs) > 0 {
+		options := &redis.FailoverOptions{
+			MasterName:    conf.Master,
+			SentinelAddrs: conf.SentinelAddrs,
+			Password:      password,
+			DB:            int64(dbNum),
+			MaxRetries:    1,
+			DialTimeout:   time.Second,
+			ReadTimeout:   time.Second,
+			WriteTimeout:  time.Second,
+			PoolSize:      conf.PoolSize,
+			PoolTimeout:   time.Second,
+			// TODO: IdleTimeout
+		}
+		client = redis.NewFailoverClient(options)
+	} else {
+		options := &redis.Options{
+			Addr:         server,
+			Password:     password,
+			DB:           int64(dbNum),
+			MaxRetries:   1,
+			DialTimeout:  time.Second,
+			ReadTimeout:  time.Second,
+			WriteTimeout: time.Second,
+			PoolSize:     conf.PoolSize,
+			PoolTimeout:  time.Second,
+			// TODO: IdleTimeout
+		}
+		client = redis.NewClient(options)
+	}
 
 	e := &RedisEngine{
 		app:          app,
