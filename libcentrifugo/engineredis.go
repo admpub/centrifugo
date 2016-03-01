@@ -460,7 +460,9 @@ func (e *RedisEngine) publish(chID ChannelID, message []byte, opts *publishOpts)
 			if opts.HistoryDropInactive {
 				dropInactive = "1"
 			}
-			err = e.pubScript.Run(e.client, []string{e.getHistoryKey(chID)}, []string{string(chID), string(message), string(messageJSON), strconv.Itoa(opts.HistorySize), strconv.Itoa(opts.HistoryLifetime), dropInactive}).Err()
+			keys := []string{e.getHistoryKey(chID)}
+			args := []string{string(chID), string(message), string(messageJSON), strconv.Itoa(opts.HistorySize), strconv.Itoa(opts.HistoryLifetime), dropInactive}
+			err = e.pubScript.Run(e.client, keys, args).Err()
 		} else {
 			err = e.client.Publish(string(chID), string(message)).Err()
 		}
@@ -501,15 +503,17 @@ func (e *RedisEngine) getHistoryKey(chID ChannelID) string {
 }
 
 func (e *RedisEngine) addPresence(chID ChannelID, uid ConnID, info ClientInfo) error {
+
 	e.app.RLock()
 	presenceExpire := e.app.config.PresenceExpireInterval
 	presenceExpireSeconds := presenceExpire.Seconds()
 	e.app.RUnlock()
+
 	infoJSON, err := json.Marshal(info)
 	if err != nil {
 		return err
 	}
-	expireAt := time.Now().Unix() + int64(presenceExpireSeconds)
+
 	hashKey := e.getHashKey(chID)
 	setKey := e.getSetKey(chID)
 
@@ -519,14 +523,15 @@ func (e *RedisEngine) addPresence(chID ChannelID, uid ConnID, info ClientInfo) e
 	}
 	defer tx.Close()
 
-	tx.ZAdd(setKey, redis.Z{Score: float64(expireAt), Member: uid})
+	expireAt := float64(time.Now().Unix() + int64(presenceExpireSeconds))
+
+	tx.ZAdd(setKey, redis.Z{Score: expireAt, Member: uid})
 	tx.HSet(hashKey, string(uid), string(infoJSON))
 	tx.Expire(setKey, presenceExpire)
 	tx.Expire(hashKey, presenceExpire)
 	_, err = tx.Exec(func() error {
 		return nil
 	})
-
 	return err
 }
 
@@ -549,47 +554,27 @@ func (e *RedisEngine) removePresence(chID ChannelID, uid ConnID) error {
 	return err
 }
 
-func mapStringClientInfo(result []string, err error) (map[ConnID]ClientInfo, error) {
-	if len(result)%2 != 0 {
-		return nil, errors.New("mapStringClientInfo expects even number of values result")
-	}
-	m := make(map[ConnID]ClientInfo, len(result)/2)
-	for i := 0; i < len(result); i += 2 {
-		key := result[i]
-		value := result[i+1]
-		var f ClientInfo
-		err = json.Unmarshal([]byte(value), &f)
-		if err != nil {
-			return nil, errors.New("can not unmarshal value to ClientInfo")
-		}
-		m[ConnID(key)] = f
-	}
-	return m, nil
-}
-
 func (e *RedisEngine) presence(chID ChannelID) (map[ConnID]ClientInfo, error) {
 
-	now := time.Now().Unix()
 	hashKey := e.getHashKey(chID)
 	setKey := e.getSetKey(chID)
-	opts := redis.ZRangeByScore{
-		Min: "0",
-		Max: strconv.Itoa(int(now)),
-	}
+
+	nowStr := strconv.Itoa(int(time.Now().Unix()))
+
+	opts := redis.ZRangeByScore{Min: "0", Max: nowStr}
 	expiredKeys, err := e.client.ZRangeByScore(setKey, opts).Result()
 	if err != nil {
 		return nil, err
 	}
 
 	if len(expiredKeys) > 0 {
-
 		tx, err := e.client.Watch(setKey, hashKey)
 		if err != nil {
 			return nil, err
 		}
 		defer tx.Close()
 
-		tx.ZRemRangeByScore(setKey, "0", strconv.Itoa(int(now)))
+		tx.ZRemRangeByScore(setKey, "0", nowStr)
 		for _, key := range expiredKeys {
 			tx.HDel(hashKey, key)
 		}
@@ -600,18 +585,46 @@ func (e *RedisEngine) presence(chID ChannelID) (map[ConnID]ClientInfo, error) {
 			return nil, err
 		}
 	}
-	reply, err := e.client.HGetAll(hashKey).Result()
+
+	result, err := e.client.HGetAll(hashKey).Result()
 	if err != nil {
 		return nil, err
 	}
-	return mapStringClientInfo(reply, nil)
+
+	if len(result)%2 != 0 {
+		return nil, errors.New("presence expects even number of values result")
+	}
+
+	m := make(map[ConnID]ClientInfo, len(result)/2)
+	for i := 0; i < len(result); i += 2 {
+		key := ConnID(result[i])
+		value := []byte(result[i+1])
+		var f ClientInfo
+		err = json.Unmarshal(value, &f)
+		if err != nil {
+			return nil, errors.New("can not unmarshal value to ClientInfo")
+		}
+		m[key] = f
+	}
+	return m, nil
 }
 
-func sliceOfMessages(result []string, err error) ([]Message, error) {
+func (e *RedisEngine) history(chID ChannelID, opts historyOpts) ([]Message, error) {
+	var rangeBound int = -1
+	if opts.Limit > 0 {
+		rangeBound = opts.Limit - 1 // Redis includes last index into result
+	}
+
+	historyKey := e.getHistoryKey(chID)
+	result, err := e.client.LRange(historyKey, 0, int64(rangeBound)).Result()
+	if err != nil {
+		return nil, err
+	}
+
 	msgs := make([]Message, len(result))
-	for i := 0; i < len(result); i++ {
+	for i, value := range result {
 		var m Message
-		err = json.Unmarshal([]byte(result[i]), &m)
+		err = json.Unmarshal([]byte(value), &m)
 		if err != nil {
 			return nil, errors.New("can not unmarshal value to Message")
 		}
@@ -620,35 +633,16 @@ func sliceOfMessages(result []string, err error) ([]Message, error) {
 	return msgs, nil
 }
 
-func (e *RedisEngine) history(chID ChannelID, opts historyOpts) ([]Message, error) {
-	var rangeBound int = -1
-	if opts.Limit > 0 {
-		rangeBound = opts.Limit - 1 // Redis includes last index into result
-	}
-	historyKey := e.getHistoryKey(chID)
-	reply, err := e.client.LRange(historyKey, 0, int64(rangeBound)).Result()
-	if err != nil {
-		return nil, err
-	}
-	return sliceOfMessages(reply, nil)
-}
-
-func sliceOfChannelIDs(result []string, prefix string, err error) ([]ChannelID, error) {
-	channels := make([]ChannelID, len(result))
-	for i := 0; i < len(result); i++ {
-		value := result[i]
-		chID := ChannelID(value)
-		channels[i] = chID
-	}
-	return channels, nil
-}
-
 // Requires Redis >= 2.8.0 (http://redis.io/commands/pubsub)
 func (e *RedisEngine) channels() ([]ChannelID, error) {
 	prefix := e.app.channelIDPrefix()
-	reply, err := e.client.PubSubChannels(prefix + "*").Result()
+	result, err := e.client.PubSubChannels(prefix + "*").Result()
 	if err != nil {
 		return nil, err
 	}
-	return sliceOfChannelIDs(reply, prefix, nil)
+	channels := make([]ChannelID, len(result))
+	for i, value := range result {
+		channels[i] = ChannelID(value)
+	}
+	return channels, nil
 }
