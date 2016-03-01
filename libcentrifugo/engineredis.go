@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/centrifugal/centrifugo/Godeps/_workspace/src/github.com/FZambia/go-logger"
-	"github.com/centrifugal/centrifugo/Godeps/_workspace/src/github.com/garyburd/redigo/redis"
+	"gopkg.in/redis.v3"
 )
 
 const (
@@ -31,7 +32,7 @@ const (
 type RedisEngine struct {
 	sync.RWMutex
 	app          *Application
-	pool         *redis.Pool
+	client       *redis.Client
 	api          bool
 	numApiShards int
 	subCh        chan subRequest
@@ -96,39 +97,6 @@ func (sr *subRequest) result() error {
 	return <-*(sr.err)
 }
 
-func newPool(server, password, db string, psize int) *redis.Pool {
-	return &redis.Pool{
-		MaxIdle:     3,
-		MaxActive:   psize,
-		Wait:        true,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", server)
-			if err != nil {
-				logger.CRITICAL.Println(err)
-				return nil, err
-			}
-			if password != "" {
-				if _, err := c.Do("AUTH", password); err != nil {
-					c.Close()
-					logger.CRITICAL.Println(err)
-					return nil, err
-				}
-			}
-			if _, err := c.Do("SELECT", db); err != nil {
-				c.Close()
-				logger.CRITICAL.Println(err)
-				return nil, err
-			}
-			return c, err
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			return err
-		},
-	}
-}
-
 func yesno(condition bool) string {
 	if condition {
 		return "yes"
@@ -172,8 +140,6 @@ func NewRedisEngine(app *Application, conf *RedisEngineConfig) *RedisEngine {
 
 	server := host + ":" + port
 
-	pool := newPool(server, password, db, conf.PoolSize)
-
 	// pubScriptSource contains lua script we register in Redis to call when publishing
 	// client message. It publishes message into channel and adds message to history
 	// list maintaining history size and expiration time. This is an optimization to make
@@ -200,12 +166,31 @@ end
 return n
 	`
 
+	dbNum, err := strconv.Atoi(db)
+	if err != nil {
+		logger.FATAL.Fatalln("Can not convert redis db to number")
+	}
+
+	options := &redis.Options{
+		Addr:         server,
+		Password:     password,
+		DB:           int64(dbNum),
+		MaxRetries:   1,
+		DialTimeout:  time.Second,
+		ReadTimeout:  time.Second,
+		WriteTimeout: time.Second,
+		PoolSize:     conf.PoolSize,
+		PoolTimeout:  time.Second,
+	}
+
+	client := redis.NewClient(options)
+
 	e := &RedisEngine{
 		app:          app,
-		pool:         pool,
+		client:       client,
 		api:          conf.API,
 		numApiShards: conf.NumAPIShards,
-		pubScript:    redis.NewScript(1, pubScriptSource),
+		pubScript:    redis.NewScript(pubScriptSource),
 	}
 	usingPassword := yesno(password != "")
 	apiEnabled := yesno(conf.API)
@@ -252,8 +237,6 @@ func (e *RedisEngine) runForever(fn func()) {
 }
 
 func (e *RedisEngine) runAPI() {
-	conn := e.pool.Get()
-	defer conn.Close()
 
 	e.app.RLock()
 	apiKey := e.app.config.ChannelPrefix + "." + "api"
@@ -262,7 +245,7 @@ func (e *RedisEngine) runAPI() {
 	done := make(chan struct{})
 	defer close(done)
 
-	popParams := []interface{}{apiKey}
+	popParams := []string{apiKey}
 	workQueues := make(map[string]chan []byte)
 	workQueues[apiKey] = make(chan []byte, 256)
 
@@ -271,9 +254,6 @@ func (e *RedisEngine) runAPI() {
 		popParams = append(popParams, queueKey)
 		workQueues[queueKey] = make(chan []byte, 256)
 	}
-
-	// Add timeout param
-	popParams = append(popParams, 0)
 
 	// Start a worker for each queue
 	for name, ch := range workQueues {
@@ -305,49 +285,53 @@ func (e *RedisEngine) runAPI() {
 	}
 
 	for {
-		reply, err := conn.Do("BLPOP", popParams...)
+		reply, err := e.client.BLPop(0, popParams...).Result()
 		if err != nil {
 			logger.ERROR.Println(err)
 			return
 		}
 
-		values, err := redis.Values(reply, nil)
-		if err != nil {
-			logger.ERROR.Println(err)
-			return
-		}
-		if len(values) != 2 {
-			logger.ERROR.Println("Wrong reply from Redis in BLPOP - expecting 2 values")
-			continue
-		}
+		println(reply)
 
-		queue, okQ := values[0].([]byte)
-		body, okVal := values[1].([]byte)
-		if !okQ || !okVal {
-			logger.ERROR.Println("Wrong reply from Redis in BLPOP - can not convert value")
-			continue
-		}
+		/*
+			values, err := redis.Values(reply, nil)
+			if err != nil {
+				logger.ERROR.Println(err)
+				return
+			}
+			if len(values) != 2 {
+				logger.ERROR.Println("Wrong reply from Redis in BLPOP - expecting 2 values")
+				continue
+			}
 
-		// Pick worker based on queue
-		q, ok := workQueues[string(queue)]
-		if !ok {
-			logger.ERROR.Println("Got message from a queue we didn't even know about!")
-			continue
-		}
+			queue, okQ := values[0].([]byte)
+			body, okVal := values[1].([]byte)
+			if !okQ || !okVal {
+				logger.ERROR.Println("Wrong reply from Redis in BLPOP - can not convert value")
+				continue
+			}
 
-		q <- body
+			// Pick worker based on queue
+			q, ok := workQueues[string(queue)]
+			if !ok {
+				logger.ERROR.Println("Got message from a queue we didn't even know about!")
+				continue
+			}
+
+			q <- body
+		*/
 	}
 }
 
 // fillBatchFromChan attempts to read items from a subRequest channel and append them to split
 // until it either hits maxSize or would have to block. If batch is empty and chan is empty then
 // batch might end up being zero length.
-func fillBatchFromChan(ch <-chan subRequest, batch *[]subRequest, chIDs *[]interface{}, maxSize int) {
+func fillBatchFromChan(ch <-chan subRequest, batch *[]subRequest, chIDs *[]string, maxSize int) {
 	for len(*batch) < maxSize {
 		select {
 		case req := <-ch:
 			*batch = append(*batch, req)
-			*chIDs = append(*chIDs, req.Channel)
+			*chIDs = append(*chIDs, string(req.Channel))
 		default:
 			return
 		}
@@ -355,8 +339,13 @@ func fillBatchFromChan(ch <-chan subRequest, batch *[]subRequest, chIDs *[]inter
 }
 
 func (e *RedisEngine) runPubSub() {
-	conn := redis.PubSubConn{Conn: e.pool.Get()}
-	defer conn.Close()
+
+	pubsub, err := e.client.Subscribe("just-to-get-pubsub-now-need-a-better-way")
+	if err != nil {
+		logger.ERROR.Println(err)
+		return
+	}
+	defer pubsub.Close()
 
 	e.app.RLock()
 	adminChannel := e.app.config.AdminChannel
@@ -379,13 +368,13 @@ func (e *RedisEngine) runPubSub() {
 				return
 			case r := <-e.subCh:
 				// Something to subscribe
-				chIDs := []interface{}{r.Channel}
+				chIDs := []string{string(r.Channel)}
 				batch := []subRequest{r}
 
 				// Try to gather as many others as we can without waiting
 				fillBatchFromChan(e.subCh, &batch, &chIDs, RedisSubscribeBatchLimit)
 				// Send them all
-				err := conn.Subscribe(chIDs...)
+				err := pubsub.Subscribe(chIDs...)
 				if err != nil {
 					// Subscribe error is fatal
 					logger.ERROR.Printf("RedisEngine Subscriber error: %v\n", err)
@@ -394,22 +383,24 @@ func (e *RedisEngine) runPubSub() {
 						batch[i].done(err)
 					}
 
+					return
+
 					// Close conn, this should cause Receive to return with err below
 					// and whole runPubSub method to restart
-					conn.Close()
-					return
+					// conn.Close()
+					// return
 				}
 				for i := range batch {
 					batch[i].done(nil)
 				}
 			case r := <-e.unSubCh:
 				// Something to subscribe
-				chIDs := []interface{}{r.Channel}
+				chIDs := []string{string(r.Channel)}
 				batch := []subRequest{r}
 				// Try to gather as many others as we can without waiting
 				fillBatchFromChan(e.unSubCh, &batch, &chIDs, RedisSubscribeBatchLimit)
 				// Send them all
-				err := conn.Unsubscribe(chIDs...)
+				err := pubsub.Unsubscribe(chIDs...)
 				if err != nil {
 					// Subscribe error is fatal
 					logger.ERROR.Printf("RedisEngine Unsubscriber error: %v\n", err)
@@ -418,10 +409,12 @@ func (e *RedisEngine) runPubSub() {
 						batch[i].done(err)
 					}
 
+					return
+
 					// Close conn, this should cause Receive to return with err below
 					// and whole runPubSub method to restart
-					conn.Close()
-					return
+					//conn.Close()
+					//return
 				}
 				for i := range batch {
 					batch[i].done(nil)
@@ -444,25 +437,29 @@ func (e *RedisEngine) runPubSub() {
 	}
 
 	for {
-		switch n := conn.Receive().(type) {
-		case redis.Message:
-			e.app.handleMsg(ChannelID(n.Channel), n.Data)
-		case redis.Subscription:
-		case error:
-			logger.ERROR.Printf("RedisEngine Receiver error: %v\n", n)
+
+		msgi, err := pubsub.Receive()
+		if err != nil {
+			logger.ERROR.Println(err)
+			return
+		}
+
+		switch msg := msgi.(type) {
+		case *redis.Message:
+			e.app.handleMsg(ChannelID(msg.Channel), []byte(msg.Payload))
+		case *redis.Subscription:
+		default:
+			logger.ERROR.Printf("RedisEngine Receiver error: unknown message %#v\n", msgi)
 			return
 		}
 	}
 }
 
 func (e *RedisEngine) publish(chID ChannelID, message []byte, opts *publishOpts) error {
-	conn := e.pool.Get()
-	defer conn.Close()
-
 	var err error
 	if opts == nil {
 		// just publish message into channel.
-		_, err = conn.Do("PUBLISH", chID, message)
+		err = e.client.Publish(string(chID), string(message)).Err()
 	} else {
 		// publish message into channel and add history message.
 		if opts.HistorySize > 0 && opts.HistoryLifetime > 0 {
@@ -471,9 +468,9 @@ func (e *RedisEngine) publish(chID ChannelID, message []byte, opts *publishOpts)
 				logger.ERROR.Println(err)
 				return nil
 			}
-			_, err = e.pubScript.Do(conn, e.getHistoryKey(chID), chID, message, messageJSON, opts.HistorySize, opts.HistoryLifetime, opts.HistoryDropInactive)
+			err = e.pubScript.Run(e.client, []string{e.getHistoryKey(chID)}, []string{string(chID), message, messageJSON, opts.HistorySize, opts.HistoryLifetime, opts.HistoryDropInactive}).Err()
 		} else {
-			_, err = conn.Do("PUBLISH", chID, message)
+			err = e.client.Publish(chID, message).Err()
 		}
 	}
 	return err
@@ -515,8 +512,6 @@ func (e *RedisEngine) addPresence(chID ChannelID, uid ConnID, info ClientInfo) e
 	e.app.RLock()
 	presenceExpireSeconds := e.app.config.PresenceExpireInterval.Seconds()
 	e.app.RUnlock()
-	conn := e.pool.Get()
-	defer conn.Close()
 	infoJSON, err := json.Marshal(info)
 	if err != nil {
 		return err
@@ -524,24 +519,40 @@ func (e *RedisEngine) addPresence(chID ChannelID, uid ConnID, info ClientInfo) e
 	expireAt := time.Now().Unix() + int64(presenceExpireSeconds)
 	hashKey := e.getHashKey(chID)
 	setKey := e.getSetKey(chID)
-	conn.Send("MULTI")
-	conn.Send("ZADD", setKey, expireAt, uid)
-	conn.Send("HSET", hashKey, uid, infoJSON)
-	conn.Send("EXPIRE", setKey, presenceExpireSeconds)
-	conn.Send("EXPIRE", hashKey, presenceExpireSeconds)
-	_, err = conn.Do("EXEC")
+
+	tx, err := e.client.Watch(setKey, hashKey)
+	if err != nil {
+		return err
+	}
+	defer tx.Close()
+
+	tx.ZAdd(setKey, expireAt, uid)
+	tx.HSet(hashKey, uid, infoJSON)
+	tx.Expire(setKey, presenceExpireSeconds)
+	tx.Expire(hashKey, presenceExpireSeconds)
+
+	_, err = tx.Exec(func() error {
+		return nil
+	})
 	return err
 }
 
 func (e *RedisEngine) removePresence(chID ChannelID, uid ConnID) error {
-	conn := e.pool.Get()
-	defer conn.Close()
+
 	hashKey := e.getHashKey(chID)
 	setKey := e.getSetKey(chID)
-	conn.Send("MULTI")
-	conn.Send("HDEL", hashKey, uid)
-	conn.Send("ZREM", setKey, uid)
-	_, err := conn.Do("EXEC")
+
+	tx, err := e.client.Watch(setKey, hashKey)
+	if err != nil {
+		return err
+	}
+	defer tx.Close()
+
+	tx.HDel(hashKey, uid)
+	tx.ZRem(setKey, uid)
+	_, err = tx.Exec(func() error {
+		return nil
+	})
 	return err
 }
 
@@ -571,31 +582,44 @@ func mapStringClientInfo(result interface{}, err error) (map[ConnID]ClientInfo, 
 }
 
 func (e *RedisEngine) presence(chID ChannelID) (map[ConnID]ClientInfo, error) {
-	conn := e.pool.Get()
-	defer conn.Close()
+
 	now := time.Now().Unix()
 	hashKey := e.getHashKey(chID)
 	setKey := e.getSetKey(chID)
-	reply, err := conn.Do("ZRANGEBYSCORE", setKey, 0, now)
+	opts := redis.ZRangeByScore{
+		Min: 0,
+		Max: now,
+	}
+	expiredKeys, err := e.client.ZRangeByScore(setKey, opts).Result()
 	if err != nil {
 		return nil, err
 	}
-	expiredKeys, err := redis.Strings(reply, nil)
-	if err != nil {
-		return nil, err
-	}
-	if len(expiredKeys) > 0 {
-		conn.Send("MULTI")
-		conn.Send("ZREMRANGEBYSCORE", setKey, 0, now)
-		for _, key := range expiredKeys {
-			conn.Send("HDEL", hashKey, key)
+	/*
+		expiredKeys, err := redis.Strings(reply, nil)
+		if err != nil {
+			return nil, err
 		}
-		_, err = conn.Do("EXEC")
+	*/
+	if len(expiredKeys) > 0 {
+
+		tx, err := e.client.Watch(setKey, hashKey)
+		if err != nil {
+			return err
+		}
+		defer tx.Close()
+
+		tx.ZRemRangeByScore(key, setKey, 0, now)
+		for _, key := range expiredKeys {
+			tx.HDel(hashKey, key)
+		}
+		_, err = tx.Exec(func() error {
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
 	}
-	reply, err = conn.Do("HGETALL", hashKey)
+	reply, err := e.client.HGetAll(hashKey)
 	if err != nil {
 		return nil, err
 	}
@@ -624,14 +648,12 @@ func sliceOfMessages(result interface{}, err error) ([]Message, error) {
 }
 
 func (e *RedisEngine) history(chID ChannelID, opts historyOpts) ([]Message, error) {
-	conn := e.pool.Get()
-	defer conn.Close()
 	var rangeBound int = -1
 	if opts.Limit > 0 {
 		rangeBound = opts.Limit - 1 // Redis includes last index into result
 	}
 	historyKey := e.getHistoryKey(chID)
-	reply, err := conn.Do("LRANGE", historyKey, 0, rangeBound)
+	reply, err := e.client.LRange(historyKey, 0, rangeBound)
 	if err != nil {
 		return nil, err
 	}
@@ -657,10 +679,8 @@ func sliceOfChannelIDs(result interface{}, prefix string, err error) ([]ChannelI
 
 // Requires Redis >= 2.8.0 (http://redis.io/commands/pubsub)
 func (e *RedisEngine) channels() ([]ChannelID, error) {
-	conn := e.pool.Get()
-	defer conn.Close()
 	prefix := e.app.channelIDPrefix()
-	reply, err := conn.Do("PUBSUB", "CHANNELS", prefix+"*")
+	reply, err := e.client.PubSubChannels(prefix + "*")
 	if err != nil {
 		return nil, err
 	}
